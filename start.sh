@@ -1,42 +1,16 @@
 #!/usr/bin/env bash
-# Envoltura local: build-mini construye la ISO, run-mini la arranca en QEMU.
+# build-mini: construye la imagen base del mini (deploy.squashfs + ISO booteable).
+# run-mini:   arranca esa ISO en QEMU para probarla.
+
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_DIR}/output}"
 ISO="${OUTPUT_DIR}/mini-deploy.iso"
-UPDATES_DIR="${UPDATES_DIR:-$(cd "${PROJECT_DIR}/.." && pwd)/tmp/updates}"
-[ -f "${PROJECT_DIR}/config.env" ] && set -a && . "${PROJECT_DIR}/config.env" && set +a
-
-PARENT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
-
-# Busca el runtime en tmp/updates/artifacts/<version>/ del proyecto padre.
-find_artifacts() {
-    if [ -n "${ARTIFACTS_DIR:-}" ] && [ -f "${ARTIFACTS_DIR}/vmlinuz" ]; then return 0; fi
-    local v
-    v="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' \
-         "${UPDATES_DIR}/manifest.json" 2>/dev/null || true)"
-    [ -n "${v}" ] && [ -f "${UPDATES_DIR}/artifacts/${v}/vmlinuz" ] || return 1
-    export ARTIFACTS_DIR="${UPDATES_DIR}/artifacts/${v}"
-    export METADATA_DIR="${METADATA_DIR:-${UPDATES_DIR}}"
-}
-
-# build-mini construye TODO: si falta el runtime, lo genera con el proyecto padre
-# (publish-lan = debootstrap + squashfs + manifest + torrent, sin firma) y sigue.
-resolve_artifacts() {
-    find_artifacts && { echo "runtime: ${ARTIFACTS_DIR}"; return; }
-    [ "${AUTO_BUILD_RUNTIME:-1}" = 1 ] || {
-        echo "ERROR: no hay runtime y AUTO_BUILD_RUNTIME=0. Pon ARTIFACTS_DIR en config.env." >&2; exit 1; }
-    echo ">> No hay runtime; construyéndolo: scripts/build.sh publish-lan"
-    ( cd "${PARENT_DIR}" && ./scripts/build.sh publish-lan )
-    find_artifacts || { echo "ERROR: publish-lan terminó pero no encuentro el runtime." >&2; exit 1; }
-    echo "runtime: ${ARTIFACTS_DIR}"
-}
 
 build_mini() {
     [ "$(id -u)" = 0 ] || { echo "Ejecuta como root: sudo ./start.sh build-mini" >&2; exit 1; }
-    resolve_artifacts
-    # Reutiliza apt-cacher-ng del proyecto principal si está escuchando en 3142.
+    # Reutiliza apt-cacher-ng si está escuchando en 3142 (el internet en casa es lento).
     if [ -z "${APT_PROXY:-}" ] && (exec 3<>/dev/tcp/127.0.0.1/3142) 2>/dev/null; then
         export APT_PROXY="http://127.0.0.1:3142"
         echo "apt-cacher-ng detectado: APT_PROXY=${APT_PROXY}"

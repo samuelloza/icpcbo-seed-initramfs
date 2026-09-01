@@ -26,9 +26,26 @@ grep -q 'set timeout=0' "${root}/build-iso.sh"
 grep -q 'show_error' "${root}/overlay/sbin/init"
 grep -q 'Preparación del equipo' "${root}/overlay/usr/lib/mini-deploy/deploy-run.sh"
 grep -q 'firmware-realtek' "${root}/packages.list"
+grep -q 'firmware-ath9k-htc' "${root}/packages.list"
+grep -q 'firmware-bnx2' "${root}/packages.list"
+if grep -q '^firmware-ralink' "${root}/packages.list"; then
+  echo 'firmware-ralink no es un paquete real, usa firmware-mediatek' >&2; exit 1
+fi
 grep -q 'ntfs-3g' "${root}/packages.list"
 grep -q '^ca-certificates$' "${root}/packages.list"
 grep -q 'update-ca-certificates' "${root}/build.sh"
+grep -q 'update-initramfs' "${root}/build.sh"
+# La imagen mini arranca sola con live-boot; su propio kernel
+grep -q '^live-boot$' "${root}/packages.list"
+grep -q 'boot=live' "${root}/build-iso.sh"
+grep -q 'boot/vmlinuz-' "${root}/build.sh"
+
+if grep -Eq 'scripts/build\.sh|tmp/updates|publish-lan' \
+    "${root}/start.sh" "${root}/build.sh" "${root}/build-iso.sh"; then
+  echo 'el build del mini no debe referirse al proyecto padre' >&2; exit 1
+fi
+
+grep -q 'Descargando metadatos' "${root}/overlay/usr/lib/mini-deploy/lan-fetch.sh"
 grep -q 'MINI_ARTIFACT_URL' "${root}/overlay/usr/lib/mini-deploy/lan-fetch.sh"
 grep -q 'ntfs|ntfs3' "${root}/overlay/usr/lib/mini-deploy/lan-fetch.sh"
 if grep -Eq 'wipefs|parted|mkfs\.' "${root}/overlay/usr/lib/mini-deploy/lan-fetch.sh"; then

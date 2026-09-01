@@ -50,21 +50,39 @@ BT_TRACKER=()
 [ -n "${MINI_TRACKER_URL:-}" ] && BT_TRACKER=(--bt-tracker="${MINI_TRACKER_URL}")
 
 # ---------------------------------------------------------------------------
-# Metadatos del contest
+# Metadatos del contest (manifest.json + contest-*.torrent)
 # ---------------------------------------------------------------------------
-# manifest.json trae el número de versión; con él se arma el nombre del
-# paquete. Si ese nombre exacto no está, se acepta cualquier contest-* que
-# haya quedado en LAN_DIR (la extensión es solo el formato de empaquetado).
+# No vienen en la imagen mini: se toman del USB si está, o se bajan del origen
+# (MINI_ARTIFACT_URL). manifest.json trae la versión; con ella se arma el nombre
+# del .torrent, necesario tanto para la copia por LAN como para sembrar luego.
 
-manifest="${LAN_DIR}/manifest.json"
+mkdir -p "${LAN_DIR}" 2>/dev/null || { LAN_DIR=/run/mini-deploy/lan; mkdir -p "${LAN_DIR}"; }
+META_URL="${MINI_METADATA_URL:-${MINI_ARTIFACT_URL:+${MINI_ARTIFACT_URL%/artifacts/*}}}"
+
+meta_src=''
+for cand in "${LAN_DIR}" "${MINI_MEDIA_DIR}${CONTEST_DIR}"; do
+    [ -f "${cand}/manifest.json" ] && { meta_src="${cand}"; break; }
+done
+if [ -z "${meta_src}" ] && [ -n "${META_URL}" ]; then
+    echo "  Descargando metadatos desde ${META_URL}"
+    curl --fail --location --retry 3 -o "${LAN_DIR}/manifest.json" "${META_URL%/}/manifest.json"
+    meta_src="${LAN_DIR}"
+fi
+[ -n "${meta_src}" ] || { echo 'Sin metadatos: no hay USB ni MINI_ARTIFACT_URL' >&2; exit 1; }
+
+manifest="${meta_src}/manifest.json"
 VERSION="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' \
     "${manifest}" 2>/dev/null || true)"
 
-bundle="${LAN_DIR}/contest-${VERSION}.torrent"
-[ -f "${bundle}" ] || bundle="$(find "${LAN_DIR}" -maxdepth 1 -name 'contest-*.torrent' -print -quit)"
+bundle="${meta_src}/contest-${VERSION}.torrent"
+[ -f "${bundle}" ] || bundle="$(find "${meta_src}" -maxdepth 1 -name 'contest-*.torrent' -print -quit)"
+if [ -z "${bundle}" ] && [ -n "${META_URL}" ] && [ -n "${VERSION}" ]; then
+    bundle="${LAN_DIR}/contest-${VERSION}.torrent"
+    curl --fail --location --retry 3 -o "${bundle}" "${META_URL%/}/contest-${VERSION}.torrent"
+fi
 
-[ -f "${manifest}" ] && [ -n "${bundle}" ] || {
-    echo 'Metadatos LAN incompletos' >&2
+[ -f "${manifest}" ] && [ -f "${bundle}" ] || {
+    echo 'Metadatos incompletos' >&2
     exit 1
 }
 
