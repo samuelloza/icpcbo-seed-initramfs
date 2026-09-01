@@ -1,0 +1,27 @@
+# Base de arranque y red
+linux-image-amd64
+initramfs-tools
+network-manager
+iproute2
+wpasupplicant
+iw
+wireless-regdb
+ntfs-3g
+firmware-iwlwifi
+firmware-realtek
+firmware-atheros
+firmware-brcm80211
+firmware-mediatek
+firmware-misc-nonfree
+firmware-libertas
+firmware-zd1211
+firmware-ralink
+
+# Transporte, integridad y salto al runtime portable
+aria2
+curl
+ca-certificates
+kexec-tools
+coreutils
+python3-minimal
+whiptail
