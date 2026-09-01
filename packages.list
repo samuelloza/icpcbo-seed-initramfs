@@ -13,11 +13,11 @@ firmware-realtek
 firmware-atheros
 firmware-ath9k-htc
 firmware-brcm80211
-firmware-bnx2
+
 firmware-mediatek
-firmware-ti-connectivity
+
 firmware-libertas
-firmware-zd1211
+
 firmware-misc-nonfree
 aria2
 curl

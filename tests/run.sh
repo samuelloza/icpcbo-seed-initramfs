@@ -27,7 +27,6 @@ grep -q 'show_error' "${root}/overlay/sbin/init"
 grep -q 'Preparación del equipo' "${root}/overlay/usr/lib/mini-deploy/deploy-run.sh"
 grep -q 'firmware-realtek' "${root}/packages.list"
 grep -q 'firmware-ath9k-htc' "${root}/packages.list"
-grep -q 'firmware-bnx2' "${root}/packages.list"
 if grep -q '^firmware-ralink' "${root}/packages.list"; then
   echo 'firmware-ralink no es un paquete real, usa firmware-mediatek' >&2; exit 1
 fi

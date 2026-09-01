@@ -53,11 +53,8 @@ un laptop cualquiera de un concursante no necesita eso para desplegar):
 | `firmware-atheros` | WiFi Qualcomm Atheros (ath3k, ath6kl, ath10k, ath11k) + Bluetooth |
 | `firmware-ath9k-htc` | WiFi USB Atheros AR7010/AR9271 (dongles) |
 | `firmware-brcm80211` | WiFi Broadcom/Cypress |
-| `firmware-bnx2` | Ethernet Broadcom NetXtremeII (docks, laptops corporativos) |
 | `firmware-mediatek` | WiFi/red MediaTek y Ralink |
-| `firmware-ti-connectivity` | WiFi TI WL12xx/WL18xx (algunos laptops/Chromebooks) |
 | `firmware-libertas` | WiFi Marvell (libertas/mwifiex) |
-| `firmware-zd1211` | WiFi USB ZyDAS (dongles antiguos) |
 | `firmware-misc-nonfree` | resto de tarjetas de red sin paquete propio |
 
 Es reconocimiento inicial de hardware, no el driver completo con todas sus
