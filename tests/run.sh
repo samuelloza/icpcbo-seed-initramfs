@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-for f in build.sh build-iso.sh overlay/usr/lib/mini-deploy/deploy-run.sh overlay/usr/lib/mini-deploy/lan-fetch.sh; do bash -n "${root}/${f}"; done
+for f in build.sh build-iso.sh start.sh overlay/usr/lib/mini-deploy/deploy-run.sh overlay/usr/lib/mini-deploy/lan-fetch.sh; do bash -n "${root}/${f}"; done
+test -x "${root}/start.sh"
+case "$("${root}/start.sh" 2>&1 || true)" in *build-mini*run-mini*) ;; *) exit 1 ;; esac
+grep -q 'build-iso.sh' "${root}/start.sh"
+grep -q 'qemu-system-x86_64' "${root}/start.sh"
 grep -q 'mksquashfs' "${root}/build.sh"
 grep -q 'nmtui' "${root}/overlay/usr/lib/mini-deploy/deploy-run.sh"
 grep -q 'tee /dev/ttyS0' "${root}/overlay/usr/lib/mini-deploy/deploy-run.sh"
