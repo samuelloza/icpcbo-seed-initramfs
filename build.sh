@@ -49,5 +49,6 @@ cp "${ROOTFS}"/boot/vmlinuz-* "${OUTPUT_DIR}/vmlinuz"
 cp "${ROOTFS}"/boot/initrd.img-* "${OUTPUT_DIR}/initrd.img"
 
 mksquashfs "${ROOTFS}" "${OUTPUT_DIR}/filesystem.squashfs" -comp xz -b 1M -Xbcj x86 -noappend \
-    -e boot proc sys run tmp var/cache/apt var/lib/apt/lists var/log
+    -wildcards -e 'boot/*' 'proc/*' 'sys/*' 'run/*' 'tmp/*' \
+    'var/cache/apt/*' 'var/lib/apt/lists/*' 'var/log/*'
 echo "Imagen base creada: ${OUTPUT_DIR}/filesystem.squashfs"

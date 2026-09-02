@@ -4,13 +4,20 @@
 # runtime copiado en el disco.
 
 show_error() {
-    clear 2>/dev/null || true
+    # No se limpia la pantalla: el detalle queda también en la consola serial.
     echo
     echo '  =================================================='
     echo '          ERROR EN LA PREPARACIÓN DEL EQUIPO'
     echo '  =================================================='
     echo
     echo "  $*"
+    echo
+    echo '  Detalle del fallo:'
+    if [ -s /run/mini-deploy/session.log ]; then
+        tail -n 30 /run/mini-deploy/session.log
+    else
+        echo '  No se generó un detalle adicional.'
+    fi
     echo
     echo '  El sistema queda detenido para revisión.'
     echo
@@ -21,13 +28,35 @@ show_error() {
 mountpoint -q /proc || mount -t proc proc /proc 2>/dev/null || true
 mountpoint -q /sys || mount -t sysfs sysfs /sys 2>/dev/null || true
 mountpoint -q /run || mount -t tmpfs tmpfs /run 2>/dev/null || true
+mkdir -p /run/dbus
 
 if command -v dbus-daemon >/dev/null 2>&1; then
-    dbus-daemon --system --fork 2>/dev/null || true
+    if ! dbus-daemon --system --fork >/var/log/mini-dbus.log 2>&1; then
+        echo 'No se pudo iniciar D-Bus; registro:'
+        cat /var/log/mini-dbus.log
+    fi
 fi
 
 if command -v NetworkManager >/dev/null 2>&1; then
-    NetworkManager --no-daemon >/var/log/mini-network.log 2>&1 &
+    # El log completo va al puerto serial; no escribe sobre la UI de tty0.
+    if [ -w /dev/ttyS0 ]; then
+        NetworkManager --no-daemon 2>&1 | tee /var/log/mini-network.log >/dev/ttyS0 &
+    else
+        NetworkManager --no-daemon >/var/log/mini-network.log 2>&1 &
+    fi
+    # deploy-run usa nmcli: no intentes DHCP hasta que el daemon exponga D-Bus.
+    networkmanager_ready=0
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if nmcli -t -f RUNNING general 2>/dev/null | grep -qx running; then
+            networkmanager_ready=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "${networkmanager_ready}" -ne 1 ]; then
+        echo 'NetworkManager no quedó listo; registro:'
+        cat /var/log/mini-network.log
+    fi
 fi
 
 if ! /usr/lib/mini-deploy/deploy-run.sh; then
