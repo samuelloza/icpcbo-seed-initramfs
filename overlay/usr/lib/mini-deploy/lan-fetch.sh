@@ -476,11 +476,11 @@ run_lpd_download() {
 # Metadatos del contest (manifest.json + contest-*.torrent)
 # ---------------------------------------------------------------------------
 # No vienen en la imagen mini: se toman del USB si está, o se bajan del origen
-# (MINI_ARTIFACT_URL). manifest.json trae la versión; con ella se arma el nombre
+# (MINI_METADATA_URL). manifest.json trae la versión; con ella se arma el nombre
 # del .torrent, necesario tanto para la copia por LAN como para sembrar luego.
 
 mkdir -p "${LAN_DIR}" 2>/dev/null || { LAN_DIR=/run/mini-deploy/lan; mkdir -p "${LAN_DIR}"; }
-META_URL="${MINI_METADATA_URL:-${MINI_ARTIFACT_URL:+${MINI_ARTIFACT_URL%/artifacts/*}}}"
+META_URL="${MINI_METADATA_URL:-}"
 
 meta_src=''
 for cand in "${LAN_DIR}" "${MINI_MEDIA_DIR}${CONTEST_DIR}"; do
@@ -495,7 +495,7 @@ if [ -z "${meta_src}" ] && [ -n "${META_URL}" ]; then
     fi
     meta_src="${LAN_DIR}"
 fi
-[ -n "${meta_src}" ] || { echo 'Sin metadatos: no hay USB ni MINI_ARTIFACT_URL' >&2; exit 1; }
+[ -n "${meta_src}" ] || { echo 'Sin metadatos: no hay USB ni MINI_METADATA_URL' >&2; exit 1; }
 
 manifest="${meta_src}/manifest.json"
 VERSION="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' \
@@ -749,7 +749,7 @@ else
     usb="${MEDIA}${CONTEST_DIR}"
     usb_released=false
     copied_from_lan=false
-    if [ -n "${MINI_ARTIFACT_URL:-}" ] || [ -f "${usb}/filesystem.squashfs" ]; then
+    if [ -n "${META_URL}" ] || [ -f "${usb}/filesystem.squashfs" ]; then
         echo "  Buscando un seed en la red local (hasta ${MINI_LAN_WAIT} s) antes de usar el respaldo..."
         if run_lpd_download "${MINI_LAN_WAIT}" --enable-dht=false --bt-exclude-tracker='*' \
             --check-integrity=true --seed-time=0 --summary-interval=1 \
@@ -760,7 +760,7 @@ else
         fi
     fi
 
-    if [ "${copied_from_lan}" = false ] && [ -n "${MINI_ARTIFACT_URL:-}" ]; then
+    if [ "${copied_from_lan}" = false ] && [ -n "${META_URL}" ]; then
         # Guarda por qué falló la LAN (peers vistos, %, velocidades) antes de
         # borrar los parciales y tirar de Internet.
         dump_diag
@@ -769,7 +769,7 @@ else
         done
         release_usb 'No se halló un seed LAN; el runtime se descargará de Internet.'
         usb_released=true
-        echo "  Descargando runtime desde ${MINI_ARTIFACT_URL}"
+        echo "  Descargando runtime desde ${META_URL}"
         for f in "${RUNTIME_FILES[@]}"; do
             copy_runtime_file "${f}" "$(artifact_url "${f}")" http
         done

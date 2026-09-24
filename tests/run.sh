@@ -303,7 +303,7 @@ fi
 
 grep -q 'Descargando metadatos' "${root}/overlay/usr/lib/mini-deploy/lan-fetch.sh"
 grep -q 'No se pudo descargar manifest.json' "${root}/overlay/usr/lib/mini-deploy/lan-fetch.sh"
-grep -q 'MINI_ARTIFACT_URL' "${root}/overlay/usr/lib/mini-deploy/lan-fetch.sh"
+grep -q 'MINI_METADATA_URL' "${root}/overlay/usr/lib/mini-deploy/lan-fetch.sh"
 grep -q 'artifact_url' "${root}/overlay/usr/lib/mini-deploy/lan-fetch.sh"
 grep -q 'urljoin' "${root}/overlay/usr/lib/mini-deploy/lan-fetch.sh"
 grep -q 'artifact_valid' "${root}/overlay/usr/lib/mini-deploy/lan-fetch.sh"
