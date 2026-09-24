@@ -25,10 +25,51 @@ show_error() {
     while :; do sleep 3600; done
 }
 
+poweroff_now() {
+    echo
+    echo '  Despliegue cancelado. Apagando el equipo...'
+    sync
+    busybox poweroff -f
+    while :; do sleep 3600; done
+}
+
+# Ctrl+Alt+Supr envía SIGINT a PID 1. Primero termina todo el grupo del
+# despliegue para que lan-fetch ejecute su trap, cierre aria2 y desmonte NTFS.
+deploy_pid=''
+safe_shutdown() {
+    trap - INT TERM
+    if [ -n "${deploy_pid}" ]; then
+        kill -TERM "-${deploy_pid}" 2>/dev/null || kill -TERM "${deploy_pid}" 2>/dev/null || true
+        wait "${deploy_pid}" 2>/dev/null || true
+    fi
+    poweroff_now
+}
+trap safe_shutdown INT TERM
+
 mountpoint -q /proc || mount -t proc proc /proc 2>/dev/null || true
 mountpoint -q /sys || mount -t sysfs sysfs /sys 2>/dev/null || true
 mountpoint -q /run || mount -t tmpfs tmpfs /run 2>/dev/null || true
 mkdir -p /run/dbus
+# No permitir que el kernel reinicie inmediatamente con Ctrl+Alt+Supr: debe
+# notificar a PID 1 para desmontar primero.
+echo 0 > /proc/sys/kernel/ctrl-alt-del 2>/dev/null || true
+
+# Equipos con RTC descargado arrancan en una fecha antigua y TLS rechaza los
+# certificados como "not yet valid". La ISO aporta un piso de tiempo confiable.
+build_epoch="$(cat /etc/mini-deploy/build-epoch 2>/dev/null || true)"
+case "${build_epoch}" in
+    ''|*[!0-9]*) ;;
+    *) [ "$(date -u +%s)" -ge "${build_epoch}" ] || date -u -s "@${build_epoch}" >/dev/null ;;
+esac
+
+# El initramfs detiene udev antes de entregar el control a este init. Hay que
+# iniciarlo otra vez para cargar teclados USB, adaptadores WiFi y hotplug real.
+if command -v udevadm >/dev/null 2>&1; then
+    /usr/lib/systemd/systemd-udevd --daemon --resolve-names=never
+    udevadm trigger --type=subsystems --action=add
+    udevadm trigger --type=devices --action=add
+    udevadm settle || true
+fi
 
 if command -v dbus-daemon >/dev/null 2>&1; then
     if ! dbus-daemon --system --fork >/var/log/mini-dbus.log 2>&1; then
@@ -59,6 +100,20 @@ if command -v NetworkManager >/dev/null 2>&1; then
     fi
 fi
 
-if ! /usr/lib/mini-deploy/deploy-run.sh; then
+# Con "console=ttyS0" el terminal de control por defecto es la SERIE, así que
+# Ctrl+C en el teclado físico (tty0) no generaría SIGINT. setsid -c hace de tty0
+# el terminal de control: Ctrl+C -> SIGINT -> lan-fetch cierra el NTFS y sale
+# con 130 -> apagamos.
+rc=0
+if [ -c /dev/tty0 ] && command -v setsid >/dev/null 2>&1; then
+    setsid -c /usr/lib/mini-deploy/deploy-run.sh <>/dev/tty0 >&0 2>&0 &
+else
+    /usr/lib/mini-deploy/deploy-run.sh &
+fi
+deploy_pid=$!
+wait "${deploy_pid}" || rc=$?
+deploy_pid=''
+if [ "${rc}" -ne 0 ]; then
+    [ "${rc}" -eq 130 ] && poweroff_now
     show_error 'El flujo de red o preparación terminó con error.'
 fi

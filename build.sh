@@ -40,9 +40,11 @@ chroot "${ROOTFS}" apt-get clean
 install -Dm0755 "${PROJECT_DIR}/overlay/usr/lib/mini-deploy/lan-fetch.sh" "${ROOTFS}/usr/lib/mini-deploy/lan-fetch.sh"
 install -Dm0755 "${PROJECT_DIR}/overlay/usr/lib/mini-deploy/deploy-run.sh" "${ROOTFS}/usr/lib/mini-deploy/deploy-run.sh"
 install -Dm0755 "${PROJECT_DIR}/overlay/sbin/init" "${ROOTFS}/sbin/init"
+mkdir -p "${ROOTFS}/etc/mini-deploy"
 if [ -f "${PROJECT_DIR}/config.env" ]; then
     install -Dm0644 "${PROJECT_DIR}/config.env" "${ROOTFS}/etc/mini-deploy/config.env"
 fi
+date -u +%s > "${ROOTFS}/etc/mini-deploy/build-epoch"
 
 # Kernel + initrd propios del mini para el arranque de la ISO.
 cp "${ROOTFS}"/boot/vmlinuz-* "${OUTPUT_DIR}/vmlinuz"

@@ -9,6 +9,8 @@ WORK_DIR="${WORK_DIR:-${PROJECT_DIR}/work}"
 STAGING="${WORK_DIR}/iso"
 
 command -v grub-mkrescue >/dev/null || { echo 'Falta grub-mkrescue' >&2; exit 1; }
+[ -d /usr/lib/grub/i386-pc ] || { echo 'Falta grub-pc-bin (arranque BIOS)' >&2; exit 1; }
+[ -d /usr/lib/grub/x86_64-efi ] || { echo 'Falta grub-efi-amd64-bin (arranque UEFI)' >&2; exit 1; }
 
 OUTPUT_DIR="${OUTPUT_DIR}" WORK_DIR="${WORK_DIR}" "${PROJECT_DIR}/build.sh"
 
@@ -26,7 +28,7 @@ serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1
 terminal_input console serial
 terminal_output console serial
 menuentry "Preparación del equipo ICPC Bolivia" {
-    linux /live/vmlinuz boot=live components noeject init=/sbin/init console=tty0 console=ttyS0,115200n8
+    linux /live/vmlinuz boot=live components toram noeject init=/sbin/init quiet splash i915.enable_guc=0 modprobe.blacklist=nouveau console=tty0 console=ttyS0,115200n8
     initrd /live/initrd.img
 }
 EOF

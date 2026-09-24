@@ -3,11 +3,16 @@ linux-image-amd64
 initramfs-tools
 live-boot
 network-manager
+udev
 iproute2
 wpasupplicant
 iw
 wireless-regdb
 ntfs-3g
+busybox
+pciutils
+usbutils
+ethtool
 firmware-iwlwifi
 firmware-realtek
 firmware-atheros
@@ -24,5 +29,6 @@ curl
 ca-certificates
 kexec-tools
 coreutils
-python3-minimal
+
+python3
 whiptail

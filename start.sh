@@ -29,7 +29,10 @@ run_mini() {
     command -v virt-install >/dev/null || { echo "Falta virt-install" >&2; exit 1; }
     command -v virsh >/dev/null || { echo "Falta virsh" >&2; exit 1; }
     local disk="${RUN_MINI_TARGET_DISK:-${DEFAULT_TARGET_DISK}}"
-    local extra_disk="${RUN_MINI_EXTRA_DISK:-${DEFAULT_EXTRA_DISK}}"
+    # Sin ':' -> un RUN_MINI_EXTRA_DISK='' EXPLÍCITO significa "sin disco extra"
+    # (test.sh lo pasa así); solo si la variable no está definida se usa el
+    # qcow2 del proyecto padre.
+    local extra_disk="${RUN_MINI_EXTRA_DISK-${DEFAULT_EXTRA_DISK}}"
     local vm_name="${MINI_VM_NAME:-mini-deploy}"
     # Windows XP fue instalado con IDE: debe ser el primer disco y conservar ese bus.
     local -a disk_args=(--disk "path=${disk},format=qcow2,bus=ide")
@@ -52,6 +55,24 @@ run_mini() {
         virsh --connect qemu:///system net-start default
     fi
 
+    # RUN_MINI_HEADLESS=1: sin SPICE ni visor (para tests con sudo sin sesión X);
+    # virt-install devuelve en cuanto la VM arranca.
+    # RUN_MINI_SERIAL_LOG=<archivo>: libvirt vuelca la consola serie a ese
+    # archivo (no requiere TTY; para capturar en scripts). Sin él, pty normal
+    # que se sigue con 'virsh console'.
+    local -a display_args=(--graphics spice --video vga --autoconsole graphical)
+    local -a serial_args=(--serial pty,target.type=isa-serial --console pty,target.type=serial)
+    if [ -n "${RUN_MINI_HEADLESS:-}" ]; then
+        display_args=(--graphics none --noautoconsole)
+    elif [ -n "${RUN_MINI_NOAUTOCONSOLE:-}" ]; then
+        display_args=(--graphics spice --video vga --noautoconsole)
+    fi
+    if [ -n "${RUN_MINI_SERIAL_LOG:-}" ]; then
+        : > "${RUN_MINI_SERIAL_LOG}"
+        serial_args=(--serial "file,path=${RUN_MINI_SERIAL_LOG}"
+                     --console pty,target.type=serial)
+    fi
+
     virt-install \
         --connect qemu:///system \
         --virt-type "$(vm_accel)" \
@@ -65,12 +86,11 @@ run_mini() {
         --cdrom "${ISO}" \
         --boot hd,cdrom,menu=on \
         --network network=default,model=e1000 \
-        --graphics spice \
-        --video vga \
-        --serial pty,target.type=isa-serial \
-        --console pty,target.type=serial \
+        "${serial_args[@]}" \
         --transient \
-        --autoconsole graphical
+        "${display_args[@]}"
+
+    [ -n "${RUN_MINI_SERIAL_LOG:-}" ] && chmod 0644 "${RUN_MINI_SERIAL_LOG}" 2>/dev/null || true
 
     echo "Consola serial: sudo virsh --connect qemu:///system console ${vm_name}"
 }
@@ -82,5 +102,6 @@ vm_accel() {
 case "${1:-}" in
     build-mini) build_mini ;;
     run-mini)   run_mini ;;
-    *) echo "Uso: sudo ./start.sh {build-mini|run-mini}" >&2; exit 1 ;;
+    test)       shift; exec "${PROJECT_DIR}/test.sh" "$@" ;;
+    *) echo "Uso: sudo ./start.sh {build-mini|run-mini|test}" >&2; exit 1 ;;
 esac

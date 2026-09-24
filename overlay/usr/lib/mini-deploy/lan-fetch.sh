@@ -6,8 +6,10 @@
 #   1. Carga y valida /etc/mini-deploy/config.env.
 #   2. Localiza los metadatos del contest (manifest + paquete) en LAN_DIR.
 #   3. Elige una partición del disco con espacio suficiente, o se detiene.
-#   4. Copia el runtime a esa partición desde la primera fuente disponible:
-#        servidor HTTP  ->  USB  ->  distribución por LAN (aria2c).
+#   4. Copia el runtime a esa partición: primero por LAN (aria2c sobre el
+#      .torrent, peers vía LPD); si en MINI_LAN_WAIT s no llega ni un byte,
+#      respaldo por servidor HTTP (curl) -> USB. El primer equipo baja de
+#      Internet una vez y el resto lo obtiene de él por LAN.
 #   5. Verifica los SHA256 y, venga de donde venga la copia, el equipo queda
 #      sembrando el paquete en la LAN para alimentar a las máquinas que
 #      arranquen después.
@@ -17,24 +19,103 @@
 set -euo pipefail
 
 # exec desde deploy-run.sh reemplaza el proceso y pierde su trap: se repite aquí.
-# Un fallo de descarga o SHA no debe dejar NTFS montado si el operador apaga.
+# Ctrl+C / apagado no debe dejar el NTFS montado ni sucio. ARIA_PID se mata
+# primero para que aria2 suelte los ficheros y umount no falle por "busy".
+ARIA_PID=''
 cleanup() {
     local rc=$?
     trap - EXIT
+    if [ -n "${ARIA_PID}" ]; then
+        kill "${ARIA_PID}" 2>/dev/null || true
+        wait "${ARIA_PID}" 2>/dev/null || true
+    fi
     [ -n "${CURRENT_TMP:-}" ] && rm -f "${CURRENT_TMP}" || true
     if mountpoint -q /mnt/mini-deploy; then
         sync || true
-        umount /mnt/mini-deploy || true
+        umount /mnt/mini-deploy 2>/dev/null || {
+            sleep 1; sync || true
+            umount -l /mnt/mini-deploy 2>/dev/null || true   # perezoso: se cierra al soltarse
+        }
+        sync || true
     fi
     exit "${rc}"
+}
+
+# Vuelca logs + estado de red/aria2 a un disco legible luego (Windows/Linux), ya
+# que el mini no deja rastro al reiniciar. Best-effort en subshell con set +e:
+# nunca aborta el flujo aunque algo dentro falle.
+dump_diag() { ( set +e; _dump_diag "$@" ); return 0; }
+_dump_diag() {
+    local dest='' i
+    if [ -n "${STAGING_ROOT:-}" ] && mountpoint -q "${STAGING_ROOT}" 2>/dev/null; then
+        dest="${STAGING_ROOT}${CONTEST_DIR}/mini-deploy-logs"
+    elif [ -n "${MEDIA:-}" ] && mountpoint -q "${MEDIA}" 2>/dev/null; then
+        dest="${MEDIA}/mini-deploy-logs"
+    else
+        return 0
+    fi
+    mkdir -p "${dest}" 2>/dev/null || return 0
+    {
+        echo "=== mini-deploy diag $(date -u '+%F %T UTC') ==="
+        echo; echo '--- ip -4 a ---';      ip -4 a 2>&1
+        echo; echo '--- ip route ---';     ip route 2>&1
+        echo; echo '--- nmcli device ---'; LC_ALL=C nmcli -t -f DEVICE,TYPE,STATE device 2>&1
+        for i in /sys/class/net/*; do
+            i="${i##*/}"; [ "${i}" = lo ] && continue
+            echo; echo "--- ${i} ---"
+            ethtool "${i}" 2>&1 | grep -E 'Speed|Duplex|Link detected' || true
+            ethtool -i "${i}" 2>&1 | grep -E 'driver|bus-info' || true
+        done
+        echo; echo '--- NIC hardware ---'
+        lspci -nn 2>/dev/null | grep -iE 'ethernet|network' || true
+        lsusb 2>/dev/null | grep -iE 'ether|wlan|wireless|network' || true
+        echo; echo '--- dmesg (firmware/red/enlace) ---'
+        dmesg 2>/dev/null | grep -iE 'firmware|link is|eth[0-9]|r815|igb|e1000|carrier' | tail -n 40 || true
+        echo; echo '--- SHA256 payload vs manifest ---'
+        ( cd "${payload:-/nonexistent}" 2>/dev/null && sha256sum -c SHA256SUMS 2>&1 ) || true
+        echo; echo '--- aria2 (¿seed completo? peers, velocidades) ---'
+        aria2_report 2>&1 || true
+    } > "${dest}/diag.txt" 2>&1
+    for i in session.log seed.log download.log; do
+        [ -f "/run/mini-deploy/${i}" ] && cp "/run/mini-deploy/${i}" "${dest}/${i}" 2>/dev/null || true
+    done
+    sync 2>/dev/null || true
+    echo "  Diagnóstico guardado en: ${dest}/  (léelo desde Windows/Linux tras reiniciar)"
+}
+
+# Dump legible del estado del torrent activo vía RPC de aria2.
+aria2_report() {
+    python3 - <<'PY' 2>/dev/null || true
+import json, urllib.request
+def rpc(m, p=[]):
+    b = json.dumps({"jsonrpc":"2.0","id":"d","method":m,"params":p}).encode()
+    r = urllib.request.Request("http://127.0.0.1:6800/jsonrpc", data=b,
+                               headers={"Content-Type":"application/json"})
+    return json.load(urllib.request.urlopen(r, timeout=2)).get("result")
+try:
+    for it in rpc("aria2.tellActive") or []:
+        c, t = int(it.get("completedLength",0)), int(it.get("totalLength",0))
+        pct = (100*c/t) if t else 0
+        state = "COMPLETO" if t and c >= t else "sin verificación adicional (SHA-256 ya validado)"
+        print(f"descarga: {c}/{t} bytes ({pct:.1f}%)  {state}")
+        print(f"  conexiones={it.get('connections')} subida={int(it.get('uploadSpeed',0))/1048576:.2f} MiB/s "
+              f"bajada={int(it.get('downloadSpeed',0))/1048576:.2f} MiB/s errores={it.get('errorCode')}")
+        for p in rpc("aria2.getPeers", [it["gid"]]) or []:
+            print(f"  peer {p.get('ip')}:{p.get('port')} seeder={p.get('seeder')} "
+                  f"up={int(p.get('uploadSpeed',0))/1024:.0f}KiB/s down={int(p.get('downloadSpeed',0))/1024:.0f}KiB/s")
+    print("stat:", rpc("aria2.getGlobalStat"))
+except Exception as e:
+    print("aria2 RPC no disponible:", e)
+PY
 }
 
 trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-# Con set -e cualquier comando que falle aborta sin decir cuál; esto nombra la causa.
-trap 'rc=$?; echo "  CAUSA: ${BASH_SOURCE[0]##*/}:${LINENO}: fallo \`${BASH_COMMAND}\` (código ${rc})" >&2; exit ${rc}' ERR
+# Con set -e cualquier comando que falle aborta sin decir cuál; esto nombra la
+# causa y deja el diagnóstico en disco antes de salir.
+trap 'rc=$?; [ "${PROGRESS_OPEN:-0}" = 1 ] && printf "\n"; echo "  CAUSA: ${BASH_SOURCE[0]##*/}:${LINENO}: fallo \`${BASH_COMMAND}\` (código ${rc})" >&2; dump_diag || true; exit ${rc}' ERR
 
 # ---------------------------------------------------------------------------
 # Configuración
@@ -60,13 +141,20 @@ require_env CONTEST_DIR MINI_MEDIA_DIR LAN_DIR MINI_STAGING_MIB
 
 MEDIA="${MINI_MEDIA_DIR}"
 MIN_FREE_MIB="${MINI_STAGING_MIB}"
+# Segundos sin recibir un solo byte por LAN antes de caer al respaldo
+# (Internet/USB). Arranque escalonado de un lab grande: subir si el switch
+# tarda en propagar el multicast LPD. Sin respaldo la espera es indefinida.
+MINI_LAN_WAIT="${MINI_LAN_WAIT:-60}"
+case "${MINI_LAN_WAIT}" in ''|*[!0-9]*) MINI_LAN_WAIT=60 ;; esac
+# Un lab grande puede tener más de 55 equipos (tope BT por defecto) en el enjambre.
+BT_MAX_PEERS="${MINI_BT_MAX_PEERS:-100}"
 STAGING_ROOT=''   # lo fija find_staging_root con la partición elegida
 STAGING_DEV=''
 CURRENT_TMP=''
 
 RUNTIME_FILES=(filesystem.squashfs vmlinuz initrd.img grub-entry.cfg)
 # No dejar el disco montado indefinidamente si la red queda congelada.
-CURL_OPTS=(--fail --location --retry 3 --connect-timeout 15 --speed-limit 1 --speed-time 120)
+CURL_OPTS=(--fail --location --progress-bar --retry 3 --connect-timeout 15 --speed-limit 1 --speed-time 120)
 
 release_usb() {
     sync
@@ -84,55 +172,305 @@ release_usb() {
 EOF
 }
 
+# Aviso llamativo justo antes de entrar en modo seed: sin esto, un operador
+# desprevenido deja el equipo sirviendo indefinidamente sin saber que ENTER
+# lo arranca. Colores ANSI, no requiere figlet/toilet ni otra dependencia.
+show_seed_banner() {
+    local reset='\033[0m' bar='\033[1;33m' box='\033[1;97;44m'
+    printf "${bar}"
+    printf '  %s\n' '################################################################'
+    printf "${reset}${box}"
+    printf '  %-62s  \n' ''
+    printf '  %-62s  \n' '        >>>  PRESIONE ENTER PARA INICIAR EL SISTEMA  <<<'
+    printf '  %-62s  \n' '           (si no, el equipo queda en MODO SEED)'
+    printf '  %-62s  \n' ''
+    printf "${reset}${bar}"
+    printf '  %s\n' '################################################################'
+    printf "${reset}\n"
+}
+
+# El latido LPD y el estado del enjambre son python; sin estos módulos el
+# descubrimiento LAN se degrada al intervalo nativo de aria2 (~5 min).
+python3 -c 'import json, socket, hashlib, urllib.request' 2>/dev/null || {
+    echo "  ADVERTENCIA: python3 incompleto (¿python3-minimal?). El descubrimiento" >&2
+    echo "               LPD y el estado del enjambre quedarán degradados." >&2
+}
+
 # Tracker BT opcional (se suma a LPD y a los del .torrent). Respaldo si el
 # switch filtra el multicast de LPD. Levantar en el origen, p. ej. opentracker.
 BT_TRACKER=()
 [ -n "${MINI_TRACKER_URL:-}" ] && BT_TRACKER=(--bt-tracker="${MINI_TRACKER_URL}")
 
-# Inventario temprano para que el operador vea qué discos hay antes de usar la
-# red. Las particiones se montan solo lectura únicamente para medir espacio.
-show_partition_inventory() {
-    local part size fs uuid mount_fs free_kb state probe_rc
+# La ruta por defecto puede ser WiFi/Internet aunque la LAN esté por cable.
+# MINI_LAN_INTERFACE permite forzarla cuando el equipo tenga varias LAN.
+LPD_INTERFACE="${MINI_LAN_INTERFACE:-$(LC_ALL=C nmcli -t -f DEVICE,TYPE,STATE device 2>/dev/null \
+    | awk -F: '$2 == "ethernet" && $3 == "connected" { print $1; exit }')}"
+[ -n "${LPD_INTERFACE}" ] || LPD_INTERFACE="$(ip -4 route show default 2>/dev/null \
+    | awk '{ for (i=1; i<NF; i++) if ($i == "dev") { print $(i+1); exit } }')"
+LOCAL_IP="$(ip -4 -o addr show dev "${LPD_INTERFACE}" scope global 2>/dev/null \
+    | awk 'NR == 1 { sub(/\/.*/, "", $4); print $4 }')"
+if [ -z "${LOCAL_IP}" ] && [ -z "${MINI_LAN_INTERFACE:-}" ]; then
+    read -r LPD_INTERFACE LOCAL_IP < <(ip -4 -o addr show scope global 2>/dev/null \
+        | awk '$2 != "lo" { sub(/\/.*/, "", $4); print $2, $4; exit }') || true
+fi
+[ -n "${LOCAL_IP}" ] || { echo "LPD requiere IPv4 en ${LPD_INTERFACE:-una interfaz de red}." >&2; exit 1; }
+BT_LAN=(--bt-enable-lpd=true --bt-lpd-interface="${LPD_INTERFACE}" --listen-port=6881)
+echo "  LPD activo en ${LPD_INTERFACE} (${LOCAL_IP}): multicast UDP 239.192.152.143:6771, peers TCP 6881."
+LINK_SPEED="$(cat "/sys/class/net/${LPD_INTERFACE}/speed" 2>/dev/null || true)"
+case "${LINK_SPEED}" in
+    ''|*[!0-9]*) ;;
+    *)
+        echo "  Enlace ${LPD_INTERFACE}: ${LINK_SPEED} Mbit/s negociados."
+        [ "${LINK_SPEED}" -gt 100 ] || echo '  ADVERTENCIA: enlace de 100 Mbit/s; ~94 Mbit/s es su máximo real.'
+        ;;
+esac
 
-    echo
-    echo '  Discos y particiones detectados (solo lectura):'
-    printf '  %-14s %-9s %-9s %-9s %-14s %s\n' 'DISPOSITIVO' 'TOTAL' 'LIBRE' 'FORMATO' 'ESTADO' 'UUID'
-    printf '  %-14s %-9s %-9s %-9s %-14s %s\n' '--------------' '---------' '---------' '---------' '--------------' '----'
-    while read -r part size; do
-        fs="$(blkid -o value -s TYPE "${part}" 2>/dev/null || true)"
-        uuid="$(blkid -o value -s UUID "${part}" 2>/dev/null || true)"
-        free_kb=''
-        state='NO COMPATIBLE'
-        case "${fs}" in
-            ext4|ext3|xfs|ntfs|ntfs3)
-                state='OK'
-                mount_fs="${fs}"
-                [ "${mount_fs}" = ntfs ] && mount_fs=ntfs3
-                if [ "${fs}" = ntfs ] && command -v ntfs-3g.probe >/dev/null 2>&1; then
-                    ntfs-3g.probe --readwrite "${part}" >/dev/null 2>&1 || {
-                        probe_rc=$?
-                        case "${probe_rc}" in
-                            14) state='BLOQ-WINDOWS' ;; # NTFS hibernado.
-                            15) state='NTFS-SUCIO' ;;
-                            16) state='EN USO' ;;
-                            *)  state="NTFS-ERR-${probe_rc}" ;;
-                        esac
-                    }
-                fi
-                mkdir -p /mnt/mini-inventory
-                if mount -t "${mount_fs}" -o ro "${part}" /mnt/mini-inventory 2>/dev/null; then
-                    free_kb="$(df -k /mnt/mini-inventory | awk 'NR == 2 { print $4 }')"
-                    umount /mnt/mini-inventory 2>/dev/null || true
-                else
-                    state='NO MONTABLE'
-                fi ;;
-        esac
-        printf '  %-14s %-9s %-9s %-9s %-14s %s\n' "${part}" "${size}" \
-            "${free_kb:+$((free_kb / 1024))MiB}" "${fs:--}" "${state}" "${uuid:--}"
-    done < <(lsblk -pnro NAME,SIZE,TYPE | awk '$3 == "part" { print $1, $2 }')
+# aria2 solo anuncia LPD cada ~5 min; una ventana LAN de MINI_LAN_WAIT s no
+# alcanza a verlo. Este latido:
+#   * calcula el infohash del .torrent LOCALMENTE (no depende del RPC de aria2,
+#     así funciona desde el primer segundo aunque el RPC tarde en levantar),
+#   * emite BT-SEARCH al grupo multicast cada MINI_LPD_INTERVAL s,
+#   * re-hace el JOIN del grupo cada ~30 s: en switches con IGMP snooping SIN
+#     querier, eso mantiene viva la entrada y evita que el switch pode el
+#     multicast (síntoma: el cliente no ve al seed y cae a Internet).
+lpd_heartbeat() {
+    python3 - "$1" "${MINI_LPD_INTERVAL:-2}" "${LOCAL_IP}" "${bundle}" <<'PY' 2>/dev/null
+import hashlib, os, socket, sys, time
+
+aria_pid = int(sys.argv[1])
+interval = float(sys.argv[2])
+local_ip = sys.argv[3]
+torrent_path = sys.argv[4]
+GROUP = "239.192.152.143"
+
+def _skip(b, i):
+    c = b[i:i+1]
+    if c == b"i":
+        return b.index(b"e", i) + 1
+    if c == b"l":
+        i += 1
+        while b[i:i+1] != b"e":
+            i = _skip(b, i)
+        return i + 1
+    if c == b"d":
+        i += 1
+        while b[i:i+1] != b"e":
+            i = _skip(b, i)          # clave
+            i = _skip(b, i)          # valor
+        return i + 1
+    j = b.index(b":", i)             # cadena
+    return j + 1 + int(b[i:j])
+
+def infohash(path):
+    b = open(path, "rb").read()
+    i = 1                            # tras la 'd' inicial
+    while b[i:i+1] != b"e":
+        ks = i; i = _skip(b, i)
+        key = b[ks:i].split(b":", 1)[1]
+        vs = i; i = _skip(b, i)
+        if key == b"info":
+            return hashlib.sha1(b[vs:i]).hexdigest()
+    return None
+
+try:
+    info_hash = infohash(torrent_path)
+except Exception:
+    info_hash = None
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(local_ip))
+sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+mreq = socket.inet_aton(GROUP) + socket.inet_aton(local_ip)
+
+def rejoin():
+    for opt in (socket.IP_DROP_MEMBERSHIP, socket.IP_ADD_MEMBERSHIP):
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, opt, mreq)
+        except OSError:
+            pass
+
+rejoin()
+tick = 0
+msg = None
+if info_hash:
+    msg = (f"BT-SEARCH * HTTP/1.1\r\nHost: {GROUP}:6771\r\n"
+           f"Port: 6881\r\nInfohash: {info_hash}\r\n\r\n\r\n").encode()
+
+while os.path.exists(f"/proc/{aria_pid}"):
+    if msg:
+        try:
+            sock.sendto(msg, (GROUP, 6771))
+        except OSError:
+            pass
+    tick += 1
+    if tick % max(1, int(30 / interval)) == 0:
+        rejoin()
+    time.sleep(interval)
+PY
 }
 
-show_partition_inventory
+# Sin esto, cada actualización imprimía líneas nuevas que empujaban hacia
+# arriba (y perdían de vista) la información previa del arranque. show()
+# repinta SIEMPRE la misma línea con \r + borrado hasta fin de línea (sin
+# \n), como una barra de progreso. progress_break (más abajo) inserta el
+# único salto de línea real cuando hay que dejar esa línea fija y seguir
+# con mensajes normales.
+PROGRESS_OPEN=0
+progress_break() {
+    if [ "${PROGRESS_OPEN}" = 1 ]; then
+        printf '\n'
+        PROGRESS_OPEN=0
+    fi
+}
+
+show_swarm_status() {
+    python3 - "$1" "${LOCAL_IP}" <<'PY' 2>/dev/null || true
+import json, os, sys, urllib.request
+
+mode, local_ip = sys.argv[1:]
+
+def show(text):
+    sys.stdout.write('\r' + text + '\x1b[K')
+    sys.stdout.flush()
+
+def rpc(method, params=[]):
+    body = json.dumps({"jsonrpc": "2.0", "id": "x", "method": method, "params": params}).encode()
+    req = urllib.request.Request('http://127.0.0.1:6800/jsonrpc', data=body,
+                                 headers={'Content-Type': 'application/json'})
+    return json.load(urllib.request.urlopen(req, timeout=2)).get('result')
+
+def mib(value):
+    return int(value or 0) / 1048576
+
+def mbit(value):
+    return int(value or 0) * 8 / 1_000_000
+
+def size(value):
+    value = int(value or 0)
+    for unit in ('B', 'KiB', 'MiB', 'GiB'):
+        if value < 1024 or unit == 'GiB':
+            return f'{value:.1f} {unit}'
+        value /= 1024
+
+def eta(remaining, speed):
+    speed = int(speed or 0)
+    if not speed:
+        return 'calculando...'
+    seconds = int(remaining / speed)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f'{hours}h {minutes:02d}m' if hours else f'{minutes}m {seconds:02d}s'
+
+try:
+    active = rpc('aria2.tellActive') or []
+    if mode == 'download' and not active:
+        stopped = rpc('aria2.tellStopped', [0, 10]) or []
+        finished = next((item for item in stopped if item.get('status') == 'complete'), None)
+        failed = next((item for item in stopped if item.get('status') in ('error', 'removed')), None)
+        if finished:
+            open('/run/mini-deploy/download-complete', 'w').close()
+            show(f"  Descarga completa; verificando archivos...")
+        elif failed:
+            open('/run/mini-deploy/download-error', 'w').close()
+            show(f"  aria2 terminó con error {failed.get('errorCode', '?')}.")
+        else:
+            show(f"  Esta máquina {local_ip} | buscando peers LPD...")
+        raise SystemExit
+    peers = [peer for item in active for peer in (rpc('aria2.getPeers', [item['gid']]) or [])]
+    ips = sorted({peer['ip'] for peer in peers})
+    seeds = sorted({peer['ip'] for peer in peers if peer.get('seeder') == 'true'})
+    stat = rpc('aria2.getGlobalStat') or {}
+    if mode == 'seed':
+        up = stat.get('uploadSpeed')
+        show(f"  Seed {local_ip} | equipos servidos: {len(ips)} ({', '.join(ips) or '-'})"
+              f" | red: {mib(up):.1f} MiB/s ({mbit(up):.0f} Mbit/s)")
+    else:
+        completed = sum(int(item.get('completedLength', 0)) for item in active)
+        total = sum(int(item.get('totalLength', 0)) for item in active)
+        remaining = max(0, total - completed)
+        pct = 100 * completed / total if total else 0
+        files = [file for item in active for file in item.get('files', [])]
+        pending = [file for file in files
+                   if int(file.get('completedLength', 0)) < int(file.get('length', 0))]
+        current = max(pending,
+                      key=lambda file: int(file['length']) - int(file.get('completedLength', 0)),
+                      default=None)
+        with open('/run/mini-deploy/download-progress', 'w') as progress:
+            progress.write(str(completed))
+        with open('/run/mini-deploy/download-seeds', 'w') as seed_count:
+            seed_count.write(str(len(seeds)))
+        down = stat.get('downloadSpeed')
+        parts = [f"Esta máquina {local_ip} | seeds: {len(seeds)} ({', '.join(seeds) or '-'})"
+              f" | peers: {len(ips)} ({', '.join(ips) or '-'})"
+              f" | red: {mib(down):.1f} MiB/s ({mbit(down):.0f} Mbit/s)",
+              f"Descarga: {pct:.1f}% | {size(completed)} de {size(total)}"
+              f" | faltan {size(remaining)} | tiempo estimado: {eta(remaining, down)}"]
+        if current:
+            file_done, file_total = int(current.get('completedLength', 0)), int(current['length'])
+            parts.append(f"Archivo: {os.path.basename(current['path'])}"
+                  f" ({100 * file_done / file_total if file_total else 0:.1f}%)")
+        show('  ' + '  ||  '.join(parts))
+except Exception:
+    show(f"  Esta máquina {local_ip} | actualizando estado; la descarga continúa...")
+PY
+    PROGRESS_OPEN=1
+}
+
+# $1 = segundos sin progreso (ni un peer, ni un byte nuevo) antes de rendirse
+# (0 = espera indefinida, sin respaldo).
+run_lpd_download() {
+    local stall_max="$1"; shift
+    local pid rc bytes last_bytes=-1 last_progress=${SECONDS}
+    rm -f /run/mini-deploy/download-progress /run/mini-deploy/download-seeds \
+        /run/mini-deploy/download-complete /run/mini-deploy/download-error
+    aria2c --enable-rpc --rpc-listen-port=6800 "${BT_LAN[@]}" \
+        --bt-max-peers="${BT_MAX_PEERS}" "$@" \
+        >/run/mini-deploy/download.log 2>&1 &
+    pid=$!
+    ARIA_PID="${pid}"
+    lpd_heartbeat "${pid}" &
+    while kill -0 "${pid}" 2>/dev/null; do
+        show_swarm_status download
+        if [ -e /run/mini-deploy/download-complete ]; then
+            progress_break
+            kill "${pid}" 2>/dev/null || true
+            wait "${pid}" 2>/dev/null || true
+            ARIA_PID=''
+            return 0
+        fi
+        if [ -e /run/mini-deploy/download-error ]; then
+            progress_break
+            kill "${pid}" 2>/dev/null || true
+            wait "${pid}" 2>/dev/null || true
+            ARIA_PID=''
+            return 1
+        fi
+        bytes="$(cat /run/mini-deploy/download-progress 2>/dev/null || echo 0)"
+        case "${bytes}" in ''|*[!0-9]*) bytes=0 ;; esac
+        [ "${bytes}" != "${last_bytes}" ] && last_progress=${SECONDS}
+        last_bytes="${bytes}"
+        if [ "${stall_max}" -gt 0 ] && [ "$((SECONDS - last_progress))" -ge "${stall_max}" ]; then
+            progress_break
+            echo "  Sin progreso (ni peers ni bytes nuevos) durante ${stall_max} s; se usa el respaldo (Internet/USB)."
+            # Congela el estado (peers, %, si el seed era completo) antes de matar aria2.
+            { echo "=== estado al agotar la ventana LAN ($(date -u '+%T')) ==="; aria2_report; } \
+                >> /run/mini-deploy/download.log 2>&1 || true
+            kill "${pid}" 2>/dev/null || true
+            wait "${pid}" 2>/dev/null || true
+            return 124
+        fi
+        sleep 2
+    done
+    progress_break
+    wait "${pid}" || {
+        rc=$?
+        tail -n 10 /run/mini-deploy/download.log >&2 || true
+        ARIA_PID=''
+        return "${rc}"
+    }
+    ARIA_PID=''
+}
 
 # ---------------------------------------------------------------------------
 # Metadatos del contest (manifest.json + contest-*.torrent)
@@ -174,6 +512,13 @@ fi
     echo 'Metadatos incompletos' >&2
     exit 1
 }
+
+# El USB puede desmontarse antes de descargar o sembrar; conserva los dos
+# metadatos que aria2 y artifact_url siguen necesitando.
+cp "${manifest}" /run/mini-deploy/manifest.json
+cp "${bundle}" /run/mini-deploy/contest.torrent
+manifest=/run/mini-deploy/manifest.json
+bundle=/run/mini-deploy/contest.torrent
 
 # El manifest es la fuente de verdad tanto para una descarga nueva como para
 # reutilizar un runtime ya presente en cualquier disco.
@@ -219,6 +564,7 @@ copy_runtime_file() {
 
     CURRENT_TMP="${payload}/${file}.tmp"
     rm -f "${CURRENT_TMP}"
+    echo "  Copiando ${file}..."
     if [ "${method}" = http ]; then
         curl "${CURL_OPTS[@]}" --output "${CURRENT_TMP}" "${source}"
     else
@@ -267,14 +613,23 @@ EOF
     while :; do sleep 3600; done
 }
 
-# Intenta arrancar un runtime ya validado. Si kexec falla, continúa buscando en
-# las otras particiones antes de descargar o escribir nada.
+# Salta al runtime copiado cuando el operador sale del modo seed.
 boot_runtime() {
     local runtime="$1" append media_uuid
 
+    # NetworkManager guarda los perfiles (WiFi, IP fija) solo en la RAM del
+    # mini. Se copian al medio para que el initramfs del runtime los reponga en
+    # cada arranque: sin esto un equipo sin cable se queda sin red tras el kexec.
+    if ls /etc/NetworkManager/system-connections/* >/dev/null 2>&1; then
+        mkdir -p "${runtime}/network"
+        cp /etc/NetworkManager/system-connections/* "${runtime}/network/" || true
+        chmod 600 "${runtime}"/network/* 2>/dev/null || true
+        echo "  Perfiles de red copiados a ${runtime}/network para el runtime."
+    fi
+
     append="$(awk '/^[[:space:]]*linux[[:space:]]/ { $1=""; $2=""; sub(/^[[:space:]]+/, ""); print; exit }' \
         "${runtime}/grub-entry.cfg" 2>/dev/null)"
-    [ -n "${append}" ] || append="contest_dir=${CONTEST_DIR} contest_root=filesystem.squashfs contest_persist=auto contest.boot_source=hdd contest.persist_scope=home console=tty0"
+    [ -n "${append}" ] || append="pcie_aspm=off contest_dir=${CONTEST_DIR} contest_root=filesystem.squashfs contest_persist=auto contest.boot_source=hdd contest.persist_scope=home console=tty0"
     media_uuid="$(blkid -o value -s UUID "${STAGING_DEV}" 2>/dev/null || true)"
     [ -n "${media_uuid}" ] && append="${append} contest.media_uuid=${media_uuid}"
 
@@ -282,54 +637,27 @@ boot_runtime() {
     if kexec --load "${runtime}/vmlinuz" --initrd="${runtime}/initrd.img" --append="${append}"; then
         sync
         umount -l "${STAGING_ROOT}" 2>/dev/null || true
+        # kexec no pasa por el BIOS/POST: si el wifi Intel queda a mitad de
+        # inicializar, el kernel del runtime hereda esos registros y iwlwifi
+        # falla el probe (-110) sin importar qué haga después. Se descarga el
+        # driver antes de saltar para que quede en un estado limpio conocido.
+        # ponytail: solo cubre iwlwifi (caso visto); sumar otros drivers wifi
+        # a esta lista si aparece el mismo síntoma con otro chipset.
+        modprobe -r iwlwifi 2>/dev/null || true
         kexec --exec || true
     fi
     kexec --unload 2>/dev/null || true
     return 1
 }
 
-boot_existing_runtimes() {
-    local part fs mount_fs candidate probe
-
-    echo '  Buscando un runtime ya validado en los discos...'
-    for part in $(lsblk -pnro NAME,TYPE | awk '$2 == "part" { print $1 }'); do
-        fs="$(blkid -o value -s TYPE "${part}" 2>/dev/null || true)"
-        case "${fs}" in
-            ext4|ext3|xfs|ntfs|ntfs3) ;;
-            *) continue ;;
-        esac
-
-        mount_fs="${fs}"
-        [ "${mount_fs}" = ntfs ] && mount_fs=ntfs3
-        mkdir -p /mnt/mini-deploy
-        mount -t "${mount_fs}" -o rw "${part}" /mnt/mini-deploy 2>/dev/null || continue
-        candidate="/mnt/mini-deploy${CONTEST_DIR}"
-        probe="${candidate}/.mini-deploy-write-probe"
-        if [ ! -d "${candidate}" ] || ! { : > "${probe}" && rm -f "${probe}"; } 2>/dev/null; then
-            echo "  Runtime en ${part} omitido: disco sin escritura segura."
-            umount /mnt/mini-deploy 2>/dev/null || true
-            continue
-        fi
-        if [ -d "${candidate}" ] && (cd "${candidate}" && sha256sum -c "${EXPECTED_SUMS}" >/dev/null 2>&1); then
-            STAGING_ROOT=/mnt/mini-deploy
-            STAGING_DEV="${part}"
-            echo "  Runtime validado en ${part}; se intenta arrancar sin descargar."
-            boot_runtime "${candidate}" || echo "  No se pudo arrancar ${part}; probando otro disco."
-        fi
-        umount /mnt/mini-deploy 2>/dev/null || true
-    done
-    return 1
-}
-
-# Recorre cada partición, prueba a montarla, mide el espacio libre y se queda
-# con la que más tenga (si supera el mínimo). Deja STAGING_ROOT apuntando a la
-# partición ya montada, o devuelve 1 si ninguna sirve.
+# Recorre cada partición una sola vez: busca un runtime válido y, si no existe,
+# se queda con la partición escribible que tenga más espacio libre.
 find_staging_root() {
-    local part fs mount_fs free_kb probe mount_error write_error
+    local part fs mount_fs free_kb candidate probe mount_error write_error
     local best_free=0 best_part='' best_fs=''
 
     echo
-    echo '  Buscando particiones existentes para el folder /icpc_bo...'
+    echo '  Buscando un runtime o una partición apta para /icpc_bo...'
     printf '  %-18s %-8s %10s  %s\n' 'PARTICIÓN' 'FORMATO' 'LIBRE' 'ESTADO'
     printf '  %-18s %-8s %10s  %s\n' '------------------' '--------' '----------' '----------------'
 
@@ -366,6 +694,19 @@ find_staging_root() {
             continue
         fi
 
+        candidate="/mnt/mini-deploy${CONTEST_DIR}"
+        if cmp -s "${candidate}/SHA256SUMS" "${EXPECTED_SUMS}"; then
+            echo "  VERIFICANDO IMAGEN en ${part}; puede tardar varios minutos..."
+            if (cd "${candidate}" && sha256sum -c "${EXPECTED_SUMS}" >/dev/null 2>&1); then
+                STAGING_ROOT=/mnt/mini-deploy
+                STAGING_DEV="${part}"
+                payload="${candidate}"
+                RUNTIME_FOUND=true
+                echo "  Runtime validado en ${part}; no se descargará nuevamente."
+                return 0
+            fi
+        fi
+
         # Columna "Available" de df, en KiB. Se desmonta enseguida: solo medimos.
         free_kb="$(df -k /mnt/mini-deploy | awk 'NR == 2 { print $4 }')"
         umount /mnt/mini-deploy 2>/dev/null || true
@@ -394,87 +735,131 @@ find_staging_root() {
     echo "  Usando ${best_part}: ${best_free} KiB libres."
 }
 
-# Si alguno arranca, kexec no regresa. Si todos fallan, recién se descarga.
-boot_existing_runtimes || true
-
+RUNTIME_FOUND=false
 find_staging_root || stop_no_disk
-payload="${STAGING_ROOT}${CONTEST_DIR}"
-mkdir -p "${payload}"
-cp "${EXPECTED_SUMS}" "${payload}/SHA256SUMS"
-
-# Se prueba cada fuente en orden y se usa la primera disponible. Siempre se
-# escribe a un .tmp y se renombra, para que un corte a media copia no deje un
-# archivo incompleto con el nombre definitivo.
-usb="${MEDIA}${CONTEST_DIR}"
-usb_released=false
-if [ -n "${MINI_ARTIFACT_URL:-}" ]; then
-    release_usb 'El runtime se descargará por red; puede usar el USB en otro equipo.'
-    usb_released=true
-    echo "  Descargando runtime desde ${MINI_ARTIFACT_URL}"
-    for f in "${RUNTIME_FILES[@]}"; do
-        copy_runtime_file "${f}" "$(artifact_url "${f}")" http
-    done
-
-elif [ -f "${usb}/filesystem.squashfs" ]; then
-    for f in "${RUNTIME_FILES[@]}"; do
-        copy_runtime_file "${f}" "${usb}/${f}" usb
-    done
-
+if [ "${RUNTIME_FOUND}" = true ]; then
+    release_usb 'El runtime ya estaba validado en el disco.'
 else
-    aria2c --bt-enable-lpd=true --enable-dht=false --check-integrity=true --seed-time=0 \
-        --summary-interval=2 --human-readable=true --console-log-level=notice \
-        "${BT_TRACKER[@]}" --dir="${STAGING_ROOT}" "${bundle}"
-fi
+    payload="${STAGING_ROOT}${CONTEST_DIR}"
+    mkdir -p "${payload}"
+    cp "${EXPECTED_SUMS}" "${payload}/SHA256SUMS"
 
-# Falla (y aborta por set -e) si algún archivo no coincide con su sha256.
-# Sin --status para que se vea qué archivo falló la verificación.
-(cd "${payload}" && sha256sum -c SHA256SUMS)
-printf 'INSTALLED_FROM=mini-deploy\n' > "${payload}/.contest-installed"
-[ "${usb_released}" = true ] || release_usb 'El runtime fue copiado y validado en el disco.'
+    # Ventana LAN de MINI_LAN_WAIT s para hallar un seed por LPD antes de tirar
+    # del respaldo. Al descubrir uno se conserva la conexión hasta completar.
+    usb="${MEDIA}${CONTEST_DIR}"
+    usb_released=false
+    copied_from_lan=false
+    if [ -n "${MINI_ARTIFACT_URL:-}" ] || [ -f "${usb}/filesystem.squashfs" ]; then
+        echo "  Buscando un seed en la red local (hasta ${MINI_LAN_WAIT} s) antes de usar el respaldo..."
+        if run_lpd_download "${MINI_LAN_WAIT}" --enable-dht=false --bt-exclude-tracker='*' \
+            --check-integrity=true --seed-time=0 --summary-interval=1 \
+            --human-readable=true --show-console-readout=true --console-log-level=notice \
+            --dir="${STAGING_ROOT}" "${bundle}" \
+            && (cd "${payload}" && sha256sum -c SHA256SUMS >/dev/null 2>&1); then
+            copied_from_lan=true
+        fi
+    fi
+
+    if [ "${copied_from_lan}" = false ] && [ -n "${MINI_ARTIFACT_URL:-}" ]; then
+        # Guarda por qué falló la LAN (peers vistos, %, velocidades) antes de
+        # borrar los parciales y tirar de Internet.
+        dump_diag
+        for f in "${RUNTIME_FILES[@]}"; do
+            artifact_valid "${f}" || rm -f "${payload}/${f}" "${payload}/${f}.aria2"
+        done
+        release_usb 'No se halló un seed LAN; el runtime se descargará de Internet.'
+        usb_released=true
+        echo "  Descargando runtime desde ${MINI_ARTIFACT_URL}"
+        for f in "${RUNTIME_FILES[@]}"; do
+            copy_runtime_file "${f}" "$(artifact_url "${f}")" http
+        done
+    elif [ "${copied_from_lan}" = false ] && [ -f "${usb}/filesystem.squashfs" ]; then
+        for f in "${RUNTIME_FILES[@]}"; do
+            copy_runtime_file "${f}" "${usb}/${f}" usb
+        done
+    elif [ "${copied_from_lan}" = false ]; then
+        # Sin Internet ni USB: la LAN es la única fuente. Se espera
+        # indefinidamente (stall_max=0) a que aparezca un seed; el orden de
+        # arranque de los equipos deja de importar.
+        echo '  Sin Internet ni USB: esperando un seed en la red local...'
+        run_lpd_download 0 --enable-dht=false --check-integrity=true --seed-time=0 \
+            --summary-interval=1 --human-readable=true --show-console-readout=true --console-log-level=notice \
+            "${BT_TRACKER[@]}" --dir="${STAGING_ROOT}" "${bundle}" \
+            || { echo '  aria2c terminó con error; revise /run/mini-deploy/download.log.' >&2; exit 1; }
+    fi
+
+    # Falla (y aborta por set -e) si algún archivo no coincide con su sha256.
+    (cd "${payload}" && sha256sum -c SHA256SUMS)
+    printf 'INSTALLED_FROM=mini-deploy\n' > "${payload}/.contest-installed"
+    [ "${usb_released}" = true ] || release_usb 'El runtime fue copiado y validado en el disco.'
+fi
 
 # ---------------------------------------------------------------------------
 # Compartir con el resto de equipos
 # ---------------------------------------------------------------------------
 
-echo '  Compartiendo con el resto de equipos. Pulsa ENTER para terminar.'
-aria2c --enable-rpc --rpc-listen-port=6800 --bt-enable-lpd=true --enable-dht=false \
-    --check-integrity=true --seed-time=525600 --seed-ratio=0.0 --summary-interval=0 \
-    "${BT_TRACKER[@]}" --dir="${STAGING_ROOT}" "${bundle}" >/dev/null 2>&1 &
-share_pid=$!
-trap 'kill "${share_pid}" 2>/dev/null || true' EXIT
+# El intento LAN cancelado deja <raíz-del-torrent>.aria2 marcando las piezas
+# como incompletas. Los SHA-256 de arriba ya validaron todo; se elimina ese
+# estado obsoleto para que --bt-seed-unverified anuncie un seed real.
+rm -f "${payload}.aria2" "${payload}"/*.aria2
 
-while kill -0 "${share_pid}" 2>/dev/null; do
-    python3 - <<'PY' 2>/dev/null || true
-import json, urllib.request
+# El mini queda EN MODO SEED por defecto: sirve el runtime al resto de equipos
+# y espera a que el operador pulse ENTER para salir y arrancar. MINI_SEED_WAIT
+# (segundos) fuerza un arranque automatico; vacio/0 = espera indefinida.
+SEED_WAIT="${MINI_SEED_WAIT:-0}"
+SEED_PID=''
 
-def rpc(method):
-    body = json.dumps({"jsonrpc": "2.0", "id": "x", "method": method, "params": []}).encode()
-    req = urllib.request.Request(
-        'http://127.0.0.1:6800/jsonrpc', data=body,
-        headers={'Content-Type': 'application/json'})
-    return json.load(urllib.request.urlopen(req, timeout=1)).get('result')
+wait_seed_exit() {
+    local ans=''
+    echo
+    if [ "${SEED_WAIT}" -gt 0 ] 2>/dev/null; then
+        echo "  Modo seed activo. ENTER = arrancar   q + ENTER = cerrar NTFS y apagar   (o espera ${SEED_WAIT} s)."
+        read -r -t "${SEED_WAIT}" ans || true
+    else
+        echo '  Modo seed activo. ENTER = arrancar   q + ENTER = cerrar NTFS y apagar.'
+        read -r ans || true
+    fi
+    [ -n "${SEED_PID}" ] && { kill "${SEED_PID}" 2>/dev/null || true; wait "${SEED_PID}" 2>/dev/null || true; }
+    case "${ans}" in q|Q) exit 130 ;; esac
+}
 
-def mib(v):
-    return int(v or 0) / 1048576
+show_seed_banner
 
-try:
-    stat = rpc('aria2.getGlobalStat') or {}
-    active = rpc('aria2.tellActive') or []
-    peers = sum(int(x.get('numPeers', x.get('connections', 0)) or 0) for x in active)
-    received = sum(int(x.get('completedLength', 0) or 0) for x in active)
-    sent = sum(int(x.get('uploadLength', 0) or 0) for x in active)
-    print(f"  Compartiendo: recibidos={mib(received):.1f} MiB | "
-          f"enviados={mib(sent):.1f} MiB | equipos conectados={peers} | "
-          f"{mib(stat.get('uploadSpeed')):.1f} MiB/s subida")
-except Exception:
-    print('  Compartiendo: esperando conexiones...')
-PY
-    read -r -t 2 _ && break || true
-done
+aria2c --enable-rpc --rpc-listen-port=6800 \
+        "${BT_LAN[@]}" --enable-dht=false --bt-max-peers="${BT_MAX_PEERS}" \
+        --check-integrity=false --bt-seed-unverified=true \
+        --seed-time=525600 --seed-ratio=0.0 --summary-interval=0 \
+        "${BT_TRACKER[@]}" --dir="${STAGING_ROOT}" "${bundle}" \
+        >/run/mini-deploy/seed.log 2>&1 &
+    share_pid=$!
+    ARIA_PID="${share_pid}"     # cleanup lo mata para soltar el NTFS antes de umount
+    lpd_heartbeat "${share_pid}" &
+    SEED_PID="${share_pid}"
+    echo "  Sembrando el runtime desde ${LOCAL_IP}:6881; anuncio LPD cada ${MINI_LPD_INTERVAL:-2} s."
+    echo '  Teclas (tecla + ENTER):  d = guardar diagnóstico en disco   q = cerrar NTFS y apagar   ENTER = salir y arrancar'
 
-trap - EXIT
-kill "${share_pid}" 2>/dev/null || true
-wait "${share_pid}" 2>/dev/null || true
+    stopped_by_enter=0
+    while kill -0 "${share_pid}" 2>/dev/null; do
+        show_swarm_status seed
+        if read -r -t 2 key; then
+            case "${key}" in
+                d|D) progress_break; dump_diag ;;
+                q|Q) progress_break; dump_diag; exit 130 ;;   # trap EXIT: cierra NTFS; init -> apaga
+                *)   stopped_by_enter=1; break ;;
+            esac
+        fi
+    done
+    progress_break
+
+    # Si aria2c murió solo, muestra la causa y espera ENTER.
+    if ! kill -0 "${share_pid}" 2>/dev/null; then
+        echo '  El proceso seed se detuvo. Detalle:' >&2
+        tail -n 10 /run/mini-deploy/seed.log >&2 || true
+    fi
+    [ "${stopped_by_enter}" = 1 ] || wait_seed_exit
+    kill "${share_pid}" 2>/dev/null || true
+    wait "${share_pid}" 2>/dev/null || true
+    ARIA_PID=''
 
 # ---------------------------------------------------------------------------
 # Arrancar el runtime ya copiado en el disco
@@ -484,5 +869,10 @@ boot_runtime "${payload}" && exit 0
 
 # Si llegamos aquí, kexec falló. No dejamos morir a PID 1: alto controlado.
 echo '  ERROR: el runtime está copiado y verificado en el disco, pero el' >&2
-echo '         arranque automático (kexec) falló. Reinicia el equipo a mano.' >&2
-while :; do sleep 3600; done
+echo '         arranque automático (kexec) falló.' >&2
+echo '         Causa más común en equipos UEFI: Secure Boot activo (bloquea' >&2
+echo '         kexec de un kernel sin firmar). Desactívalo en la BIOS y vuelve' >&2
+echo '         a arrancar el mini: detectará el runtime ya validado en disco,' >&2
+echo '         no descargará nada y hará kexec de nuevo.' >&2
+tail -n 5 /run/mini-deploy/session.log 2>/dev/null >&2 || true
+exit 1
